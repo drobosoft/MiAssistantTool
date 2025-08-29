@@ -48,12 +48,7 @@ jobs:
 
     - name: Build for Windows
       run: |
-        for arch in i686 x86_64; do
-          suffix=""
-          if [ "$arch" == "i686" ]; then
-            suffix="32"
-            op="x86"
-          elif [ "$arch" == "x86_64" ]; then
+        for arch in i686 x86_64; do        
             suffix="64"
             op="x64"
           fi
@@ -64,39 +59,11 @@ jobs:
             -lusb-1.0 -lssl -lcrypto -lcurl
         done
 
-    - name: Build miasst for Termux
-      run: |
-        for arch in arm aarch64; do
-          docker run --name $arch --privileged \
-            -v $(pwd)/miasst.c:/data/data/com.termux/files/home/miasst.c \
-            -v $(pwd)/tiny-json:/data/data/com.termux/files/home/tiny-json \
-            termux/termux-docker:$arch bash -c "yes | pkg install clang && yes | pkg install libusb && yes | pkg install libc++ && clang -o miasst_termux_$arch miasst.c tiny-json/tiny-json.c -I/usr/include/openssl -I. -lssl -lcrypto -lcurl -lusb-1.0"
-          docker cp $arch:/data/data/com.termux/files/home/miasst_termux_$arch ./
-        done
-
-    - name: Build for Ubuntu
-      run: |
-        gcc -o miasst_ubuntu miasst.c tiny-json/tiny-json.c \
-          -I/usr/include/openssl -I. -lssl -lcrypto -lcurl -lusb-1.0
-
     - name: Upload
       run: |
         VERSION=$(grep -oP '#define VERSION "\K[^"]+' miasst.c)
         gh release upload $VERSION ./miasst_windows32.exe ./miasst_windows64.exe ./miasst_ubuntu ./miasst_termux_aarch64 ./miasst_termux_arm --clobber
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@v4
-    - run: |
-        brew install libusb openssl curl
-        git clone https://github.com/rafagafe/tiny-json.git
-
-    - name: Build miasst for macOS
-      run: |
-        clang -o miasst_macos miasst.c tiny-json/tiny-json.c -I/System/Volumes/Data/opt/homebrew/Cellar/libusb/1.0.27/include -I/System/Volumes/Data/opt/homebrew/opt/openssl/include -L/System/Volumes/Data/opt/homebrew/Cellar/libusb/1.0.27/lib -L/System/Volumes/Data/opt/homebrew/opt/openssl/lib -I. -lssl -lcrypto -lcurl -lusb-1.0
-
-    - name: Upload macOS Build
       run: |
         VERSION=$(awk -F'"' '/#define VERSION/ {print $2}' miasst.c)
         gh release upload $VERSION ./miasst_macos --clobber
