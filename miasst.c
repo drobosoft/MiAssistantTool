@@ -1,5 +1,5 @@
 #define VERSION "1.2"
-#define REPOSITORY "https://github.com/offici5l/MiAssistantTool"
+#define REPOSITORY "https://github.com/drobosoft/MiAssistantTool"
 
 #ifdef _WIN32
 #include <libusb.h>
@@ -35,6 +35,14 @@ char branch[80];
 char language[80];
 char region[80];
 char romzone[80];
+
+// override values (can be set via command-line args)
+char override_device[80] = "";
+char override_version[80] = "";
+char override_sn[80] = "";
+char override_codebase[80] = "";
+char override_branch[80] = "";
+char override_romzone[80] = "";
 
 int bulk_in;
 int bulk_out;
@@ -185,6 +193,9 @@ const char *validate_check(const char *md5, int flash) {
     char json_request[1024];
     sprintf(json_request, "{\"d\":\"%s\",\"v\":\"%s\",\"c\":\"%s\",\"b\":\"%s\",\"sn\":\"%s\",\"l\":\"en-US\",\"f\":\"1\",\"options\":{\"zone\":%s},\"pkg\":\"%s\"}", device, version, codebase, branch, sn, romzone, md5);
 
+    // Print original JSON to be sent (before padding)
+    printf("[DEBUG] JSON request (original): %s\n", json_request);
+
     int len = strlen(json_request);
     int mod_len = 16 - (len % 16);
     if (mod_len > 0) memset(json_request + len, mod_len, mod_len), len += mod_len;
@@ -219,6 +230,9 @@ const char *validate_check(const char *md5, int flash) {
     char encoded_buf[EVP_ENCODE_LENGTH(enc_out_len)];
     EVP_EncodeBlock((unsigned char*)encoded_buf, enc_out, enc_out_len);
 
+    // Print base64 encoded payload
+    printf("[DEBUG] Encoded (base64) payload: %s\n", encoded_buf);
+
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
 
@@ -229,20 +243,22 @@ const char *validate_check(const char *md5, int flash) {
     }
 
     size_t post_buf_len = strlen(json_post_data) + strlen("q=&t=&s=1") + 1;
-    unsigned char *post_buf = (unsigned char *)malloc(post_buf_len);
-    if (!post_buf) {
+    unsigned char *post_buf_send = (unsigned char *)malloc(post_buf_len);
+    if (!post_buf_send) {
         curl_free(json_post_data);
         curl_easy_cleanup(curl);
         return NULL;
     }
 
-    snprintf((char*)post_buf, post_buf_len, "q=%s&t=&s=1", json_post_data);
+    snprintf((char*)post_buf_send, post_buf_len, "q=%s&t=&s=1", json_post_data);
+    // Print POST body (URL-escaped)
+    printf("[DEBUG] POST body: %s\n", post_buf_send);
     curl_free(json_post_data);
 
     FILE *response_file = fopen("response.tmp", "wb");
     if (!response_file) {
         perror("Error opening file for writing");
-        free(post_buf);
+        free(post_buf_send);
         curl_easy_cleanup(curl);
         return NULL;
     }
@@ -250,24 +266,25 @@ const char *validate_check(const char *md5, int flash) {
     curl_easy_setopt(curl, CURLOPT_URL, "http://update.miui.com/updates/miotaV3.php");
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "MiTunes_UserAgent_v3.0");
     curl_easy_setopt(curl, CURLOPT_POST, 1);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_buf);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_buf_send);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fwrite);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response_file);
 
     if (curl_easy_perform(curl) != CURLE_OK) {
         perror("Error during curl_easy_perform");
         fclose(response_file);
-        free(post_buf);
+        free(post_buf_send);
         curl_easy_cleanup(curl);
         return NULL;
     }
     fclose(response_file);
-    free(post_buf);
     curl_easy_cleanup(curl);
 
+    // Read server response
     FILE *response_file_read = fopen("response.tmp", "rb");
     if (!response_file_read) {
         perror("Failed to open file for reading");
+        free(post_buf_send);
         return NULL;
     }
 
@@ -279,6 +296,7 @@ const char *validate_check(const char *md5, int flash) {
     if (!response_buffer) {
         perror("Memory allocation failed");
         fclose(response_file_read);
+        free(post_buf_send);
         return NULL;
     }
 
@@ -286,29 +304,100 @@ const char *validate_check(const char *md5, int flash) {
     response_buffer[response_size] = '\0';
     fclose(response_file_read);
 
-    int decoded_len = EVP_DecodeBlock((unsigned char*)post_buf, (unsigned char*)response_buffer, response_size);
-    free(response_buffer);
-    remove("response.tmp");
+    // Print raw server response
+    printf("[DEBUG] Raw server response (base64 or raw): %s\n", response_buffer);
+
+    // Decode base64 response into a separate buffer
+    unsigned char *decoded_buf = malloc(response_size + 4); // ensure some extra space
+    if (!decoded_buf) {
+        perror("Memory allocation failed");
+        free(response_buffer);
+        free(post_buf_send);
+        return NULL;
+    }
+    int decoded_len = EVP_DecodeBlock(decoded_buf, (unsigned char*)response_buffer, response_size);
+    if (decoded_len < 0) decoded_len = 0;
+    // Ensure null-termination for printing
+    if (decoded_len >= 0) {
+        if ((size_t)decoded_len >= (response_size + 4)) decoded_buf[response_size + 3] = '\0';
+        else decoded_buf[decoded_len] = '\0';
+    }
+
+    printf("[DEBUG] Base64-decoded server response (len=%d): %s\n", decoded_len, decoded_len > 0 ? (char*)decoded_buf : "(empty)");
+
+    // Decrypt decoded response
+    unsigned char *decrypted_buf = malloc(decoded_len + 32);
+    if (!decrypted_buf) {
+        perror("Memory allocation failed");
+        free(decoded_buf);
+        free(response_buffer);
+        free(post_buf_send);
+        return NULL;
+    }
 
     ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return NULL;
+    if (!ctx) {
+        free(decrypted_buf);
+        free(decoded_buf);
+        free(response_buffer);
+        free(post_buf_send);
+        return NULL;
+    }
 
     EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv);
     int plain_len = 0, temp_len = 0;
-    EVP_DecryptUpdate(ctx, post_buf, &plain_len, post_buf, decoded_len);
-    EVP_DecryptFinal_ex(ctx, post_buf + plain_len, &temp_len);
+    if (decoded_len > 0) EVP_DecryptUpdate(ctx, decrypted_buf, &plain_len, decoded_buf, decoded_len);
+    EVP_DecryptFinal_ex(ctx, decrypted_buf + plain_len, &temp_len);
+    plain_len += temp_len;
     EVP_CIPHER_CTX_free(ctx);
 
-    char *start = strchr((char*)post_buf, '{');
-    char *end = strrchr((char*)post_buf, '}');
-    if (!start || !end) return NULL;
+    // Null-terminate decrypted data for printing
+    if (plain_len >= 0) decrypted_buf[plain_len] = '\0';
+    printf("[DEBUG] Decrypted response (len=%d): %s\n", plain_len, plain_len > 0 ? (char*)decrypted_buf : "(empty)");
 
-    memmove(post_buf, start, end - start + 1);
-    post_buf[end - start + 1] = '\0';
-    // printf("Response after decryption: %s\n", post_buf); 
+    // Prepare JSON substring from decrypted data
+    char *start = strchr((char*)decrypted_buf, '{');
+    char *end = strrchr((char*)decrypted_buf, '}');
+    if (!start || !end) {
+        // cleanup
+        free(decrypted_buf);
+        free(decoded_buf);
+        free(response_buffer);
+        free(post_buf_send);
+        return NULL;
+    }
+
+    size_t json_len = end - start + 1;
+    char *json_buf = malloc(json_len + 1);
+    if (!json_buf) {
+        free(decrypted_buf);
+        free(decoded_buf);
+        free(response_buffer);
+        free(post_buf_send);
+        return NULL;
+    }
+    memcpy(json_buf, start, json_len);
+    json_buf[json_len] = '\0';
+
+    // printf("Response after decryption: %s\n", json_buf);
     json_t pool[10000];
-    json_t const *parsed_json = json_create((char *)post_buf, pool, 10000);
-    if (!parsed_json) return NULL;
+    json_t const *parsed_json = json_create((char *)json_buf, pool, 10000);
+    if (!parsed_json) {
+        free(json_buf);
+        free(decrypted_buf);
+        free(decoded_buf);
+        free(response_buffer);
+        free(post_buf_send);
+        return NULL;
+    }
+
+    // free temporary buffers we no longer need
+    free(json_buf);
+    free(decrypted_buf);
+    free(decoded_buf);
+    free(response_buffer);
+    free(post_buf_send);
+    remove("response.tmp");
 
     if (flash == 1) {
         json_t const *pkg_rom = json_getProperty(parsed_json, "PkgRom");
@@ -340,9 +429,9 @@ const char *validate_check(const char *md5, int flash) {
                 }
                 json_t const *cA = json_getProperty(parsed_json, json_getName(child));
                 if (cA) {
-                    json_t const *md5 = json_getProperty(cA, "md5");
-                    if (md5) {
-                        printf("\n%s: %s\nmd5: %s\n", json_getName(child), json_getValue(json_getProperty(cA, "name")), json_getValue(md5));
+                    json_t const *md5p = json_getProperty(cA, "md5");
+                    if (md5p) {
+                        printf("\n%s: %s\nmd5: %s\n", json_getName(child), json_getValue(json_getProperty(cA, "name")), json_getValue(md5p));
                     } 
                 }     
             }
@@ -353,27 +442,38 @@ const char *validate_check(const char *md5, int flash) {
 
 int start_sideload(const char *sideload_file, const char *validate) {
 
+    printf("[DEBUG] start_sideload: file='%s' validate='%s'\n", sideload_file ? sideload_file : "(null)", validate ? validate : "(null)");
     printf("\n\n");
     FILE *fp = fopen(sideload_file, "r");
     if (!fp) {
         perror("Failed to open file");
+        printf("[DEBUG] fopen failed for '%s'\n", sideload_file);
         return 1;
     }
 
     fseek(fp, 0, SEEK_END);
     long file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);  
-    char sideload_host_command[128 + strlen(validate)];
+    printf("[DEBUG] file_size=%ld\n", file_size);
+    char sideload_host_command[128 + (validate ? strlen(validate) : 0)];
     memset(sideload_host_command, 0, sizeof(sideload_host_command));
-    sprintf(sideload_host_command, "sideload-host:%ld:%d:%s:0", file_size, ADB_SIDELOAD_CHUNK_SIZE, validate);
+    sprintf(sideload_host_command, "sideload-host:%ld:%d:%s:0", file_size, ADB_SIDELOAD_CHUNK_SIZE, validate ? validate : "");
+    printf("[DEBUG] sideload_host_command='%s'\n", sideload_host_command);
 
-    send_command(ADB_OPEN, 1, 0, sideload_host_command, strlen(sideload_host_command) + 1);
+    if (send_command(ADB_OPEN, 1, 0, sideload_host_command, strlen(sideload_host_command) + 1)) {
+        printf("[DEBUG] send_command ADB_OPEN failed\n");
+    } else {
+        printf("[DEBUG] send_command ADB_OPEN sent\n");
+    }
 
     uint8_t *work_buffer = malloc(ADB_SIDELOAD_CHUNK_SIZE);
     if (!work_buffer) {
         perror("Failed to allocate memory");
+        printf("[DEBUG] malloc work_buffer failed\n");
         fclose(fp);
         return 1;
+    } else {
+        printf("[DEBUG] allocated work_buffer %d bytes\n", ADB_SIDELOAD_CHUNK_SIZE);
     }
 
     char dummy_data[64];
@@ -383,45 +483,72 @@ int start_sideload(const char *sideload_file, const char *validate) {
 
     while (1) {
         pkt.cmd = 0;
-        recv_packet(&pkt, dummy_data, &dummy_data_size);
+        int recv_res = recv_packet(&pkt, dummy_data, &dummy_data_size);
+        printf("[DEBUG] recv_packet returned %d, pkt.cmd=0x%08x arg0=%u arg1=%u len=%u dummy_data_size=%d\n", recv_res, (unsigned int)pkt.cmd, (unsigned int)pkt.arg0, (unsigned int)pkt.arg1, (unsigned int)pkt.len, dummy_data_size);
 
-        dummy_data[dummy_data_size] = 0;
+        if (recv_res) {
+            printf("[DEBUG] recv_packet error, breaking loop\n");
+            break;
+        }
+
+        if (dummy_data_size >= (int)sizeof(dummy_data)) {
+            printf("[DEBUG] dummy_data_size too large: %d, truncating\n", dummy_data_size);
+            dummy_data[sizeof(dummy_data)-1]=0;
+        } else {
+            dummy_data[dummy_data_size] = 0;
+        }
+
         if(dummy_data_size > 8) {
-            printf("\n\n%s\n\n", dummy_data);
+            printf("\n\n[DEBUG] Long message from device: %s\n\n", dummy_data);
             break;
         }
 
         if (pkt.cmd == ADB_OKAY) {
+            printf("[DEBUG] Received ADB_OKAY, replying with ADB_OKAY\n");
             send_command(ADB_OKAY, pkt.arg1, pkt.arg0, NULL, 0);
         }
 
         if (pkt.cmd == ADB_TRANSFER_DONE && total_sent > 0) {
-            //struct timespec ts = {6, 0};
-            //nanosleep(&ts, NULL);
-            //continue;
+            printf("[DEBUG] Received ADB_TRANSFER_DONE, total_sent=%ld\n", total_sent);
         }
 
         if (pkt.cmd != ADB_WRTE) {
+            printf("[DEBUG] Packet cmd 0x%08x is not ADB_WRTE, continue\n", (unsigned int)pkt.cmd);
             continue;
         }
 
         long block = strtol(dummy_data, NULL, 10);
+        printf("[DEBUG] block parsed=%ld\n", block);
         long offset = block * ADB_SIDELOAD_CHUNK_SIZE;
-        if (offset > file_size) break;
+        printf("[DEBUG] calculated offset=%ld\n", offset);
+        if (offset > file_size) {
+            printf("[DEBUG] offset (%ld) > file_size (%ld), breaking\n", offset, file_size);
+            break;
+        }
         int to_write = ADB_SIDELOAD_CHUNK_SIZE;
-        if(offset + ADB_SIDELOAD_CHUNK_SIZE > file_size) 
-            to_write = file_size - offset;        
+        if(offset + ADB_SIDELOAD_CHUNK_SIZE > file_size)
+            to_write = file_size - offset;
+        printf("[DEBUG] to_write=%d\n", to_write);
         fseek(fp, offset, SEEK_SET);
-        fread(work_buffer, 1, to_write, fp);
-        send_command(ADB_WRTE, pkt.arg1, pkt.arg0, work_buffer, to_write);
-        send_command(ADB_OKAY, pkt.arg1, pkt.arg0, NULL, 0);
-        total_sent += to_write;
-
-        printf("\rFlashing in progress ... %d/100%%", (int)(((float)total_sent / (1024 * 1024 * 1024) / 2) * 100 / (file_size / (1024 * 1024 * 1024))) > 100 ? 100 : (int)(((float)total_sent / (1024 * 1024 * 1024) / 2) * 100 / (file_size / (1024 * 1024 * 1024))));
+        size_t read_bytes = fread(work_buffer, 1, to_write, fp);
+        printf("[DEBUG] fread read %zu bytes\n", read_bytes);
+        if (read_bytes == 0 && to_write > 0) {
+            printf("[DEBUG] fread returned 0, possible read error or EOF\n");
+            break;
+        }
+        int sc = send_command(ADB_WRTE, pkt.arg1, pkt.arg0, work_buffer, read_bytes);
+        printf("[DEBUG] send_command ADB_WRTE returned %d\n", sc);
+        int sc2 = send_command(ADB_OKAY, pkt.arg1, pkt.arg0, NULL, 0);
+        printf("[DEBUG] send_command ADB_OKAY returned %d\n", sc2);
+        total_sent += read_bytes;
+        int percent = file_size > 0 ? (int)((total_sent * 100) / file_size) : 100;
+        if (percent > 100) percent = 100;
+        printf("\rFlashing in progress ... %d/100%% (total_sent=%ld/%ld)", percent, total_sent, file_size);
         fflush(stdout);
 
     }
 
+    printf("\n[DEBUG] Exiting sideload loop, total_sent=%ld\n", total_sent);
     free(work_buffer);
     fclose(fp);
     return 0;
@@ -493,6 +620,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Parse optional overrides from remaining argv entries
+    for (int ai = 2; ai < argc; ai++) {
+        if (strncmp(argv[ai], "--device=", 9) == 0) strncpy(override_device, argv[ai] + 9, sizeof(override_device) - 1);
+        else if (strncmp(argv[ai], "--version=", 10) == 0) strncpy(override_version, argv[ai] + 10, sizeof(override_version) - 1);
+        else if (strncmp(argv[ai], "--sn=", 5) == 0) strncpy(override_sn, argv[ai] + 5, sizeof(override_sn) - 1);
+        else if (strncmp(argv[ai], "--codebase=", 11) == 0) strncpy(override_codebase, argv[ai] + 11, sizeof(override_codebase) - 1);
+        else if (strncmp(argv[ai], "--branch=", 9) == 0) strncpy(override_branch, argv[ai] + 9, sizeof(override_branch) - 1);
+        else if (strncmp(argv[ai], "--romzone=", 10) == 0) strncpy(override_romzone, argv[ai] + 10, sizeof(override_romzone) - 1);
+    }
 
     #ifdef _WIN32
         int method = 2;
@@ -544,6 +680,14 @@ int main(int argc, char *argv[]) {
     strncpy(language, adb_cmd("getlanguage:"), sizeof(language) - 1);
     strncpy(region, adb_cmd("getregion:"), sizeof(region) - 1);
     strncpy(romzone, adb_cmd("getromzone:"), sizeof(romzone) - 1);
+
+    // Apply overrides if any
+    if (strlen(override_device) > 0) strncpy(device, override_device, sizeof(device) - 1);
+    if (strlen(override_version) > 0) strncpy(version, override_version, sizeof(version) - 1);
+    if (strlen(override_sn) > 0) strncpy(sn, override_sn, sizeof(sn) - 1);
+    if (strlen(override_codebase) > 0) strncpy(codebase, override_codebase, sizeof(codebase) - 1);
+    if (strlen(override_branch) > 0) strncpy(branch, override_branch, sizeof(branch) - 1);
+    if (strlen(override_romzone) > 0) strncpy(romzone, override_romzone, sizeof(romzone) - 1);
 
     switch (choice) {
         case 1: {
